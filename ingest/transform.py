@@ -14,6 +14,7 @@ from pathlib import Path
 from ingest.config import COMPOSITION_IMAGE_BASE, PRODUCT_IMAGE_BASE
 from ingest.derive import (
     derive_composable,
+    derive_dietary_tags,
     derive_menu_step,
     derive_persons,
     derive_price_ref,
@@ -45,6 +46,28 @@ def _safe_int(val: object) -> int | None:
         return None
 
 
+# Smallest real beverage container in the catalog is a 37.5cl half-bottle; a 33cl
+# can is 330. Anything under this is the raw field being a mass, not a volume.
+MIN_PLAUSIBLE_VOLUME_ML = 200
+
+
+def _volume_ml(raw: dict, menu_step: str | None) -> int | None:
+    """Bottle volume in millilitres, for Boissons only.
+
+    Carrefour ships this in ``raw.weight`` as a decimal STRING ("750.0000"), so
+    Mongo can neither compare nor sum it. On food, the same field is a mass in
+    grams — hence the menu_step guard.
+    """
+    if menu_step != "Boissons":
+        return None
+    ml = _safe_int(raw.get("weight"))
+    if not ml or ml < MIN_PLAUSIBLE_VOLUME_ML:
+        # Tea boxes (34 g) and ground coffee (250 g) reuse the same field for a
+        # MASS. Returning None keeps the per-guest arithmetic from dividing by it.
+        return None
+    return ml
+
+
 def transform_product(raw: dict, all_prices: dict[int, list[float]]) -> dict:
     """Transform one ``products.jsonl`` record into a ``products`` collection document.
 
@@ -63,6 +86,7 @@ def transform_product(raw: dict, all_prices: dict[int, list[float]]) -> dict:
     is_composable = derive_composable(raw)
     recommendable = derive_recommendable(raw)
     persons = derive_persons(raw)
+    dietary_tags = derive_dietary_tags(raw)
     price_ref = derive_price_ref(all_prices.get(product_id, []))
 
     # Composition — resolve piece image URLs
@@ -152,6 +176,12 @@ def transform_product(raw: dict, all_prices: dict[int, list[float]]) -> dict:
         # main|side for Plats products (None elsewhere) — lets the engine require one
         # protein main + optional accompaniments. From batch_classify_roles.
         "dish_role": raw.get("dish_role_llm"),
+        # Drink family — selects the Carrefour proportion rule ("Vins : 1 bouteille
+        # pour 4 personnes"…). Only set on Boissons; None everywhere else.
+        "drink_role": raw.get("drink_role_llm"),
+        # Bottle volume in ml, parsed out of the raw decimal string — the unit the
+        # per-guest drink ratios are computed in. None outside Boissons.
+        "volume_ml": _volume_ml(raw, menu_step),
         # Event(s) this product genuinely suits, e.g. ["Anniversaire", "Spécial enfant"],
         # or ["ALL"] for versatile products. From batch_classify_event_fit.
         "could_fit_event": raw.get("could_fit_event_llm") or ["ALL"],
@@ -162,6 +192,10 @@ def transform_product(raw: dict, all_prices: dict[int, list[float]]) -> dict:
         # to back a real "Composer" flow (see derive_recommendable).
         "recommendable": recommendable,
         "persons": persons,
+        # Diet restrictions only (Carrefour's own type_envie values) — read by the
+        # composer and the dietary critic. Rewritten on every ingest so a product
+        # Carrefour re-tags cannot keep a stale restriction.
+        "dietary_tags": dietary_tags,
         "price_ref": price_ref,  # median across stores; None if no price data
         # ── Product details ──────────────────────────────────────
         "department": raw.get("carrefour_suppliers_department"),

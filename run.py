@@ -18,10 +18,11 @@ Usage::
 Environment variables::
 
     MONGO_URI           MongoDB connection string   (default: mongodb://localhost:27017)
-    MONGO_DB            Database name               (default: carrefour_traiteur)
+    MONGO_DB            Database name               (default: waib_carrefour_traiteur_dev_db)
+    GEMINI_API_KEY      Required for --products (LLM classification)
     OPENAI_API_KEY      Required for --pinecone
     PINECONE_API_KEY    Required for --pinecone
-    PINECONE_INDEX_NAME Pinecone index              (default: waib-dev-large)
+    PINECONE_INDEX_NAME Pinecone index              (default: waib-carrefour-dev-large)
     EMBEDDING_MODEL     OpenAI model                (default: text-embedding-3-small)
     LOG_LEVEL           Logging verbosity           (default: INFO)
     LOG_FORMAT          console | json              (default: auto-detect via TTY)
@@ -29,15 +30,19 @@ Environment variables::
 
 import argparse
 import gzip
-import io
 import json
 import sys
 from pathlib import Path
 
 from tqdm import tqdm
 
-from ingest.categorize import batch_categorize, batch_classify_event_fit, batch_classify_roles
 from ingest.catalogue import build_store_catalogue
+from ingest.categorize import (
+    batch_categorize,
+    batch_classify_drink_roles,
+    batch_classify_event_fit,
+    batch_classify_roles,
+)
 from ingest.concepts import load_store_concepts
 from ingest.config import INGEST_NON_RECOMMENDABLE, PRICES_FILE, PRODUCTS_FILE, STORES_FILE
 from ingest.db import (
@@ -223,12 +228,19 @@ def ingest_products(force_categorize: bool = False) -> None:
     # ── Step 2c: Tag could_fit_event for ALL products (cache-first) ──
     event_fit_cache = batch_classify_event_fit(db, raw_products, force=force_categorize)
 
-    # ── Step 3: Inject menu_step_llm + dish_role_llm + could_fit_event_llm ──
+    # Drink family (eau/vin/champagne…) — drives the Carrefour proportion rules,
+    # since nb_portion is missing on virtually every drink (1 of 166).
+    drink_role_cache = batch_classify_drink_roles(
+        db, raw_products, step_cache, force=force_categorize
+    )
+
+    # ── Step 3: Inject menu_step_llm + dish_role_llm + could_fit_event_llm + drink_role_llm ──
     for raw in raw_products:
         pid = int(raw["product_id"])
         raw["menu_step_llm"] = step_cache.get(pid)
         raw["dish_role_llm"] = role_cache.get(pid)
         raw["could_fit_event_llm"] = event_fit_cache.get(pid)
+        raw["drink_role_llm"] = drink_role_cache.get(pid)
 
     # ── Step 4: Transform + upsert ──
     total = len(raw_products)
@@ -280,7 +292,7 @@ def ingest_products(force_categorize: bool = False) -> None:
         log.warning(
             "unclassified_products_detected",
             count=step_counts["unclassified"],
-            hint="Set LOG_LEVEL=DEBUG to see individual products. Consider updating CATEGORY_TO_STEP in menu_step_mapping.py.",
+            hint="Set LOG_LEVEL=DEBUG to see individual products. Consider refining SYSTEM_PROMPT in ingest/categorize.py.",
         )
 
 

@@ -26,7 +26,14 @@ from typing import Any
 
 from tqdm import tqdm
 
-from ingest.config import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL, INGEST_NON_RECOMMENDABLE, OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME
+from ingest.config import (
+    EMBEDDING_DIMENSIONS,
+    EMBEDDING_MODEL,
+    INGEST_NON_RECOMMENDABLE,
+    OPENAI_API_KEY,
+    PINECONE_API_KEY,
+    PINECONE_INDEX_NAME,
+)
 from ingest.log import get_logger
 
 log = get_logger(__name__)

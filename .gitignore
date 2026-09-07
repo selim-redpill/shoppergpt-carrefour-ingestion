@@ -1,7 +1,9 @@
-# Data files — never commit raw exports
-data/*.jsonl
-data/*.csv
-data/*.json
+# Raw Carrefour exports and local samples — never commit
+data/
+data_samples/
+
+# Generated reports (scripts/missing_portions.py writes here by default)
+missing_portions.json
 
 # Env
 .env
@@ -12,13 +14,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-
-# Poetry virtualenv (local)
 .venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
 
 # OS
 .DS_Store
-
-# Data
-data/
-data_samples/

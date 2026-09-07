@@ -18,6 +18,10 @@ each menu step, three things, persisted on the store document:
     so a cheap side (gratin) must not define its cost. Absent when no product
     in the step has a known portion size (e.g. drinks).
 
+An active store that sells nothing orderable gets an explicit empty
+``step_catalogue: {}`` rather than no field at all, so "fulfils nothing" is
+distinguishable from "never computed".
+
 Must be run **after** ``--products`` and ``--prices`` have both been ingested,
 so that the ``products`` and ``prices`` collections are up to date.
 
@@ -181,5 +185,23 @@ def build_store_catalogue(db) -> int:
             steps=list(doc["step_catalogue"].keys()),
         )
 
-    log.info("catalogue_build_complete", stores_updated=updated)
+    # A store with no priced active product never appears in the aggregation above,
+    # so it would keep NO step_catalogue at all — indistinguishable from a store
+    # whose catalogue was simply never computed (this step skipped, fresh database).
+    # Writing an explicit empty object makes "this store can fulfil nothing" a
+    # positive, readable fact: the API can then exclude it from store suggestions
+    # without a filter that would silently empty the list whenever --catalogue has
+    # not been run.
+    empty = db.stores.update_many(
+        {"is_active": True, "step_catalogue": {"$exists": False}},
+        {"$set": {"step_catalogue": {}, "step_families": {}, "step_typical_cost": {}}},
+    )
+    if empty.modified_count:
+        log.warning(
+            "stores_with_empty_catalogue",
+            count=empty.modified_count,
+            hint="Active stores selling nothing orderable — flagged explicitly, not left absent.",
+        )
+
+    log.info("catalogue_build_complete", stores_updated=updated, empty_catalogue=empty.modified_count)
     return updated

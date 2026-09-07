@@ -1,7 +1,7 @@
 """
 LLM-based product categorization for Carrefour Traiteur.
 
-Replaces the static rule-based menu_step_mapping.py with a Gemini call.
+Replaces the original static category→step mapping with a Gemini call.
 Results are cached by product_id in MongoDB — each product is only categorized once.
 Subsequent ingests use the cached value instantly.
 
@@ -16,6 +16,7 @@ Usage (called from run.py before transform_product):
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -205,6 +206,218 @@ def batch_classify_roles(
     for role in final.values():
         dist[role] = dist.get(role, 0) + 1
     log.info("dish_role_complete", from_cache=len(cached), via_llm=len(llm_by_pid), distribution=dist)
+    return final
+
+
+# ── Drink role — which proportion rule sizes a drink (fourth pass) ────────────
+# Carrefour supplies nb_portion (→ `persons`) on virtually every food product, but
+# on only 1 of 166 drinks. Quantities for drinks were therefore left to the model,
+# which sized EVERY drink to cover EVERY guest — four drinks meant four times the
+# need (observed: 103€ of drinks on a 28€ step envelope).
+#
+# Carrefour publishes proportion rules per drink family ("Vins : 1 bouteille pour
+# 4 personnes", "Champagnes : 1 pour 6"…). Those apply to the FAMILY as a whole,
+# so the family is what we need to know per product. Tagged once here, at ingest,
+# exactly like dish_role — the engine then does the arithmetic in code.
+
+VALID_DRINK_ROLES = {
+    "eau",
+    "soft",
+    "vin",
+    "petillant",
+    "champagne",
+    "biere",
+    "cidre",
+    "spiritueux",
+    "aperitif",
+    "chaud",
+}
+# Cheapest family, drunk by everyone, never sized on adults alone: a
+# misclassification lands on the safe side of both the budget and the guest count.
+DRINK_ROLE_FALLBACK = "soft"
+_DRINK_ROLE_LOOKUP: dict[str, str] = {r.upper(): r for r in VALID_DRINK_ROLES}
+
+DRINK_ROLE_SYSTEM_PROMPT = """Tu es un expert en traiteur français. Pour chaque BOISSON ci-dessous, indique sa famille.
+
+eau : eau plate ou gazeuse NON aromatisée (source, minérale).
+soft : boissons sans alcool — jus, nectars, sodas, limonades, thés glacés, boissons aux fruits, cocktails sans alcool, bières sans alcool, eaux aromatisées.
+vin : vin tranquille rouge, blanc ou rosé (y compris désigné par sa seule appellation : Riesling, Chablis, Coteaux-du-Layon, Sancerre…).
+petillant : vin effervescent AUTRE que champagne — crémant, prosecco, mousseux, clairette.
+champagne : champagne uniquement.
+biere : bière AVEC alcool.
+cidre : cidre.
+spiritueux : alcools forts et liqueurs — whisky, vodka, rhum, gin, tequila, cognac, liqueurs.
+aperitif : apéritifs à diluer — Aperol, Spritz, vermouth, porto, pastis.
+chaud : boissons chaudes — café, thé en sachets/vrac, infusions, chocolat chaud.
+
+ATTENTION aux pièges de nommage :
+- "bière sans alcool" → soft (pas biere)
+- "eau aromatisée", "eau gazeuse aromatisée" → soft (pas eau)
+- "thé glacé", "boisson au thé" → soft (pas chaud)
+- "jus de pomme pétillant" (Champomy), "cocktail sans alcool" → soft (pas petillant)
+
+Réponds UNIQUEMENT en JSON valide où les clés sont les NUMÉROS des produits :
+{"1": "vin", "2": "soft", ...}
+En cas de doute absolu, utilise "soft"."""
+
+# Deterministic override, applied AFTER the model. These are naming traps where the
+# family contradicts the words in the name, so a model reading that name is fooled
+# by the same thing a keyword match would be — and the cost is asymmetric: sizing a
+# flavoured water as table water also exempts it from budget arbitration, and
+# sizing an alcohol-free beer on adults only under-serves everyone else.
+_DRINK_ROLE_OVERRIDES: list[tuple[str, str]] = [
+    (r"sans[\s-]?alcool", "soft"),
+    (r"\beaux?\b.{0,20}aromatis", "soft"),
+    (r"th[ée] glac|boisson au th[ée]|ice[\s-]?tea", "soft"),
+    (r"champomy", "soft"),
+    # Kept LAST: a box of tea bags / ground coffee is a hot drink, not a soft.
+    # The iced-tea patterns above must win over this one.
+    (r"\bth[ée]s?\b|caf[ée]|chicor[ée]e|infusion", "chaud"),
+]
+
+
+def _drink_role_override(name: str) -> str | None:
+    """Family imposed by an unambiguous naming trap, or None."""
+    for pattern, role in _DRINK_ROLE_OVERRIDES:
+        if re.search(pattern, name, re.IGNORECASE):
+            return role
+    return None
+
+
+def _call_drink_role_batch(batch: list[tuple[int, dict]]) -> dict[int, str]:
+    """Ask Gemini for the family of a batch of drinks. Returns {index: role}."""
+    lines = [_format_product(i, raw) for i, raw in batch]
+    prompt = f"{DRINK_ROLE_SYSTEM_PROMPT}\n\nBoissons :\n" + "\n".join(lines)
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
+    }
+    for attempt in range(3):
+        try:
+            response = _make_request(GEMINI_MODEL, payload)
+            text = response["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            parsed = json.loads(text)
+            result = {}
+            for k, v in parsed.items():
+                try:
+                    idx = int(k)
+                except (ValueError, TypeError):
+                    continue
+                result[idx] = _DRINK_ROLE_LOOKUP.get(
+                    str(v).upper().strip(), DRINK_ROLE_FALLBACK
+                )
+            return result
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 503) and attempt < 2:
+                time.sleep(2**attempt * 2)
+                continue
+            log.warning("gemini_drink_role_http_error", code=exc.code, batch_size=len(batch))
+            return {i: DRINK_ROLE_FALLBACK for i, _ in batch}
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            if attempt < 2:
+                time.sleep(1.5**attempt)
+                continue
+            log.warning("gemini_drink_role_failed", error=str(exc), batch_size=len(batch))
+            return {i: DRINK_ROLE_FALLBACK for i, _ in batch}
+    return {i: DRINK_ROLE_FALLBACK for i, _ in batch}
+
+
+def _load_drink_role_cache(db: Database, product_ids: list[int]) -> dict[int, str]:
+    cached = {}
+    for doc in db.products.find(
+        {"_id": {"$in": product_ids}, "drink_role": {"$ne": None}, "drink_role_source": "llm"},
+        {"_id": 1, "drink_role": 1},
+    ):
+        cached[doc["_id"]] = doc["drink_role"]
+    return cached
+
+
+def _save_drink_role_cache(db: Database, role_map: dict[int, str]) -> None:
+    ops = [
+        UpdateOne({"_id": pid}, {"$set": {"drink_role": role, "drink_role_source": "llm"}})
+        for pid, role in role_map.items()
+    ]
+    if ops:
+        db.products.bulk_write(ops, ordered=False)
+
+
+def batch_classify_drink_roles(
+    db: Database,
+    raw_products: list[dict],
+    step_map: dict[int, str],
+    force: bool = False,
+) -> dict[int, str]:
+    """Tag a drink family on BOISSONS products only (cache-first, like dish_role).
+
+    Args:
+        db: MongoDB handle.
+        raw_products: raw JSONL dicts (must have ``product_id``).
+        step_map: ``{product_id: menu_step}`` from batch_categorize — selects Boissons.
+        force: ignore cache and re-classify.
+
+    Returns:
+        ``{product_id: role}`` for drinks (empty for the rest).
+    """
+    drink_ids = [
+        int(r["product_id"])
+        for r in raw_products
+        if step_map.get(int(r["product_id"])) == "Boissons"
+    ]
+    if not drink_ids:
+        return {}
+    id_to_raw = {int(r["product_id"]): r for r in raw_products}
+
+    cached: dict[int, str] = {} if force else _load_drink_role_cache(db, drink_ids)
+    to_classify = [pid for pid in drink_ids if pid not in cached]
+    log.info(
+        "drink_role_start",
+        drinks=len(drink_ids),
+        from_cache=len(cached),
+        via_llm=len(to_classify),
+    )
+    if not to_classify:
+        return cached
+
+    indexed = [(i, id_to_raw[pid]) for i, pid in enumerate(to_classify, start=1)]
+    batches = [indexed[i : i + BATCH_SIZE] for i in range(0, len(indexed), BATCH_SIZE)]
+    index_to_pid = {i: pid for i, pid in enumerate(to_classify, start=1)}
+    llm_results: dict[int, str] = {}
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(batches))) as executor:
+        futures = {executor.submit(_call_drink_role_batch, batch): batch for batch in batches}
+        for future in as_completed(futures):
+            llm_results.update(future.result())
+
+    llm_by_pid = {
+        index_to_pid[idx]: role for idx, role in llm_results.items() if idx in index_to_pid
+    }
+    # Fallback for anything the model dropped, then the naming-trap overrides.
+    overridden = 0
+    for pid in to_classify:
+        name = str(id_to_raw[pid].get("name") or "")
+        forced = _drink_role_override(name)
+        if forced:
+            if llm_by_pid.get(pid) != forced:
+                overridden += 1
+            llm_by_pid[pid] = forced
+        else:
+            llm_by_pid.setdefault(pid, DRINK_ROLE_FALLBACK)
+
+    _save_drink_role_cache(db, llm_by_pid)
+    final = {**cached, **llm_by_pid}
+    dist: dict[str, int] = {}
+    for role in final.values():
+        dist[role] = dist.get(role, 0) + 1
+    log.info(
+        "drink_role_complete",
+        from_cache=len(cached),
+        via_llm=len(llm_by_pid),
+        overridden_by_name=overridden,
+        distribution=dist,
+    )
     return final
 
 

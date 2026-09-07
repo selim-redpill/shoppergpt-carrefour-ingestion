@@ -4,10 +4,11 @@ from raw Carrefour product records.
 
 Philosophy: stay as close as possible to Carrefour's raw data.
 We derive only what is strictly required for the app to function:
-  - menu_step   → from LLM (see ingest/categorize.py) — NOT derived here anymore
-  - persons     → from Carrefour's nb_portion field only
-  - price_ref   → median across stores
+  - menu_step     → from LLM (see ingest/categorize.py) — NOT derived here anymore
+  - persons       → from Carrefour's nb_portion field only
+  - price_ref     → median across stores
   - recommendable → filter out "compose-it-yourself" products
+  - dietary_tags  → the diet-related subset of Carrefour's own type_envie
 
 Everything else (dietary restrictions, allergens, occasion tags, etc.)
 is kept as raw Carrefour data and left to the LLM to interpret.
@@ -94,6 +95,39 @@ def derive_recommendable(product: dict) -> bool:
         return True
     name = (product.get("name") or "").lower()
     return not any(kw in name for kw in _NON_RECOMMENDABLE_NAME_KEYWORDS)
+
+
+# ── dietary_tags ──────────────────────────────────────────────────────────────
+# Carrefour mixes two unrelated things in ``type_envie``: sensory/occasion tags
+# (salé, froid, gastronomique…) and actual dietary restrictions (sans porc,
+# végétarien…). waib-api needs the restrictions ISOLATED — it feeds them to the
+# composer and to the dietary critic, which must not have to guess which of a
+# dozen tags is a diet. So this is a strict projection of Carrefour's own
+# vocabulary, never an inference: a product is only "végétarien" because
+# Carrefour said so.
+#
+# This whitelist is the exhaustive set of diet values observed in the export
+# (checked against all active products). A value Carrefour adds later is simply
+# not surfaced until it is added here — deliberately fail-closed, because
+# inventing a restriction is far worse than missing one.
+_DIETARY_ENVIE_TAGS = frozenset({"sans porc", "sans viande", "sans poisson", "végétarien"})
+
+
+def derive_dietary_tags(product: dict) -> list[str]:
+    """Diet restrictions carried by Carrefour's ``type_envie``, in export order.
+
+    Returns an empty list when the product has none — never None, so the API can
+    treat "no tag" uniformly whether or not the field was ever written.
+    """
+    raw = product.get("type_envie") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    seen: list[str] = []
+    for tag in raw:
+        label = str(tag).strip().lower()
+        if label in _DIETARY_ENVIE_TAGS and label not in seen:
+            seen.append(label)
+    return seen
 
 
 # ── persons ───────────────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@ A single module-level client is created lazily on first call to ``get_db``
 so the connection is shared across the entire ingestion run.
 """
 
+import re
 from datetime import datetime, timezone
 
 from pymongo import ASCENDING, GEOSPHERE, MongoClient, UpdateOne
@@ -17,12 +18,26 @@ log = get_logger(__name__)
 
 _client: MongoClient | None = None
 
+# mongodb+srv://user:password@host/... — the password must never reach a log
+# line. In Kubernetes every stdout line is shipped to the log aggregator, so
+# logging the URI verbatim persists the database credentials outside the secret
+# that holds them.
+# The password segment is matched greedily up to the LAST "@" of the authority
+# (anything but "/"), so a password that itself contains an unescaped "@" is
+# redacted whole instead of leaking its tail.
+_CREDENTIALS_RE = re.compile(r"://([^:/@]+):([^/]*)@")
+
+
+def _redacted(uri: str) -> str:
+    """The connection URI with its password replaced, safe to log."""
+    return _CREDENTIALS_RE.sub(r"://\1:***@", uri)
+
 
 def get_db():
     """Return the MongoDB database, creating the client on first call."""
     global _client
     if _client is None:
-        log.info("mongo_connecting", uri=MONGO_URI, db=MONGO_DB)
+        log.info("mongo_connecting", uri=_redacted(MONGO_URI), db=MONGO_DB)
         _client = MongoClient(MONGO_URI)
     return _client[MONGO_DB]
 
