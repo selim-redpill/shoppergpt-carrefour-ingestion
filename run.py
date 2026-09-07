@@ -39,6 +39,7 @@ from tqdm import tqdm
 from ingest.catalogue import build_store_catalogue
 from ingest.categorize import (
     batch_categorize,
+    batch_classify_diets,
     batch_classify_drink_roles,
     batch_classify_event_fit,
     batch_classify_roles,
@@ -234,13 +235,20 @@ def ingest_products(force_categorize: bool = False) -> None:
         db, raw_products, step_cache, force=force_categorize
     )
 
-    # ── Step 3: Inject menu_step_llm + dish_role_llm + could_fit_event_llm + drink_role_llm ──
+    # Diet profile predicted from the ingredient list — OUR inference, not Carrefour's
+    # data (see the section header in categorize.py). Carrefour's own diet field tags
+    # exactly 1 of the 265 main dishes vegetarian, and that one is a surimi dish.
+    diet_cache = batch_classify_diets(db, raw_products, force=force_categorize)
+
+    # ── Step 3: Inject menu_step_llm + dish_role_llm + could_fit_event_llm +
+    #           drink_role_llm + predicted_diet_llm ──
     for raw in raw_products:
         pid = int(raw["product_id"])
         raw["menu_step_llm"] = step_cache.get(pid)
         raw["dish_role_llm"] = role_cache.get(pid)
         raw["could_fit_event_llm"] = event_fit_cache.get(pid)
         raw["drink_role_llm"] = drink_role_cache.get(pid)
+        raw["predicted_diet_llm"] = diet_cache.get(pid)
 
     # ── Step 4: Transform + upsert ──
     total = len(raw_products)

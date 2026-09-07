@@ -14,6 +14,7 @@ Usage (called from run.py before transform_product):
     # step_cache: {product_id: menu_step}
 """
 
+import html
 import json
 import os
 import re
@@ -35,7 +36,7 @@ log = get_logger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-GEMINI_MODEL = "gemini-3.1-flash-lite"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 BATCH_SIZE = 50    # products per Gemini call
 MAX_WORKERS = 10   # parallel Gemini calls
 FALLBACK_STEP = "Plats"  # safe fallback for uncategorizable products — broadest, most generic step
@@ -604,6 +605,262 @@ def batch_classify_event_fit(
     return final
 
 
+# ── Diet prediction (OURS, not Carrefour's) ───────────────────────────────────
+#
+# WHAT THIS IS FOR: composing a VARIED menu. It answers "what kind of dish is this,
+# broadly" so the assistant can put a meat main, a fish main and a meat-free main on the
+# same wedding table instead of three trays of beef. It is a CONCEPT-level judgement.
+#
+# WHAT THIS IS NOT: a dietary guarantee. Carrefour Traiteur does not certify restrictions
+# today, and neither do we. So this must never reach a customer as a promise — not
+# "halal", not "casher", not "guaranteed vegetarian". The field name, the `source` marker
+# and the wording sent to the model all keep it labelled as our own estimate.
+#
+# Deliberately NOT precise, and that is a product decision, not a shortcut. Judging at
+# ingredient-trace level produced worse menus, not safer ones: "4 verrines pesto tomates
+# et mozzarella" was ruled non-vegetarian by a "Traces éventuelles de POISSON" line, and
+# "Cannellonis ricotta épinards" by beef gelatin used as a texture agent. Both are
+# vegetarian dishes by any cook's reckoning, and excluding them shrinks the menu without
+# protecting anyone — because the guarantee was never on offer in the first place.
+#
+# Why it exists at all: Carrefour's own diet field cannot carry a menu. Of the 265 main
+# dishes it tags exactly one `végétarien`, "Tagliatelles au surimi", which is a fish
+# dish, while 14 genuinely meat-free mains at a single store carry no tag. A 100-guest
+# wedding was served two kinds of potato as its vegetarian option.
+
+# Mutually exclusive, ordered from most to least restrictive. A dish gets exactly one.
+DIET_PROFILES = ("vegan", "vegetarien", "poisson", "viande")
+_DIET_PROFILE_LOOKUP: dict[str, str] = {p.upper(): p for p in DIET_PROFILES}
+
+# What we believe the dish CONTAINS, read off the ingredient list. Religious
+# compatibility is derived from these downstream rather than asserted here: pork and
+# alcohol are observable in a list of ingredients, "halal" is a certification.
+DIET_CONTAINS = (
+    "porc",
+    "alcool",
+    "crustaces",
+    "poisson",
+    "viande",
+    "lait",
+    "oeuf",
+    "gelatine",
+)
+_DIET_CONTAINS_LOOKUP: dict[str, str] = {c.upper(): c for c in DIET_CONTAINS}
+
+# No fallback profile. A failed or impossible classification stays None — "unknown" is
+# the honest answer and the guards downstream treat it as "no evidence", never as
+# "contains meat" or "is vegetarian". Inventing "viande" here would quietly hide 77
+# vegetarian dishes; inventing "vegetarien" would put fish on a vegetarian's plate.
+DIET_PREDICTION_SOURCE = "waib_llm_ingredients"
+
+DIET_SYSTEM_PROMPT = (
+    "Tu es un chef traiteur qui trie une carte pour composer des menus variés. Pour "
+    "chaque plat ci-dessous, tu disposes de son nom et de sa liste d'ingrédients. Dis à "
+    "quelle CATÉGORIE DE PLAT il appartient, comme le ferait un cuisinier qui lit une "
+    "carte — pas comme un service d'allergologie.\n\n"
+    "`profil` — exactement UNE valeur :\n"
+    "- \"vegan\" : plat entièrement végétal (légumes, céréales, légumineuses), sans "
+    "fromage, sans œuf, sans crème.\n"
+    "- \"vegetarien\" : plat sans viande ni poisson, à base de légumes, de fromage, "
+    "d'œuf ou de pâtes — une pizza margherita, une quiche aux légumes, des cannellonis "
+    "ricotta-épinards, des pâtes au pesto.\n"
+    "- \"poisson\" : le plat est un plat de poisson ou de fruits de mer — c'est son "
+    "ingrédient principal.\n"
+    "- \"viande\" : le plat est un plat de viande, de volaille ou de charcuterie — "
+    "c'est son ingrédient principal.\n\n"
+    "RAISONNE AU CONCEPT DU PLAT, pas à la trace :\n"
+    "- IGNORE totalement les mentions « traces éventuelles de… » : ce sont des "
+    "avertissements d'usine, pas des ingrédients.\n"
+    "- IGNORE les additifs techniques en quantité infime (gélatine, présure, arômes, "
+    "bouillon) : des cannellonis ricotta-épinards restent un plat végétarien même si "
+    "leur liste mentionne de la gélatine.\n"
+    "- Fonde-toi sur les ingrédients PRINCIPAUX, ceux qui font le plat. Si le nom "
+    "annonce un plat de légumes et que les ingrédients principaux sont des légumes, du "
+    "fromage et des pâtes, c'est \"vegetarien\".\n"
+    "- En revanche, un ingrédient animal qui FAIT le plat compte pleinement : jambon "
+    "dans une pizza jambon-fromage, thon dans une verrine au thon, chorizo dans un "
+    "soufflé au chorizo, lardons dans une quiche lorraine.\n\n"
+    "`contient` — parmi "
+    + ", ".join(DIET_CONTAINS)
+    + " — ce que le plat contient DE FAÇON SIGNIFICATIVE, au même niveau de lecture "
+    "(un plat au jambon → \"porc\" ; une sauce au vin → \"alcool\" ; une trace "
+    "d'usine → rien).\n\n"
+    "RÈGLE ABSOLUE : si la liste d'ingrédients est absente et que le nom ne permet pas "
+    'de trancher, réponds `{"profil": null, "contient": []}`. Sinon, tranche : un plat '
+    "sans profil est un plat que l'assistant ne pourra pas proposer pour varier un "
+    "menu.\n\n"
+    "Réponds UNIQUEMENT en JSON valide, les clés étant les NUMÉROS des plats :\n"
+    '{"1": {"profil": "vegetarien", "contient": ["lait", "oeuf"]}, '
+    '"2": {"profil": "viande", "contient": ["porc"]}, '
+    '"3": {"profil": null, "contient": []}}'
+)
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+# Carrefour's ingredient lists are HTML fragments with escaped entities
+# ("P&acirc;te (eau, sel...)"). Long enough to carry the whole recipe, short enough to
+# keep 50 of them in one prompt.
+_MAX_INGREDIENTS_CHARS = 700
+
+
+def _clean_ingredients(raw_html: str | None) -> str:
+    """Flatten a Carrefour ingredient list into plain text. Empty when there is none."""
+    if not raw_html:
+        return ""
+    text = html.unescape(str(raw_html))
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = html.unescape(text)  # entities sometimes survive one pass ("&amp;eacute;")
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+    return text[:_MAX_INGREDIENTS_CHARS]
+
+
+def _format_diet_product(i: int, raw: dict) -> str:
+    name = raw.get("name") or ""
+    ingredients = _clean_ingredients(raw.get("ingredients"))
+    return f'{i}. Nom: "{name}"\n   Ingrédients: {ingredients or "ABSENTS"}'
+
+
+def _parse_diet_value(value: Any) -> dict[str, Any]:
+    """One product's answer → a stored prediction. Anything unusable becomes unknown."""
+    if not isinstance(value, dict):
+        return {"profile": None, "contains": []}
+    profile = _DIET_PROFILE_LOOKUP.get(str(value.get("profil") or "").upper().strip())
+    raw_contains = value.get("contient")
+    contains = (
+        sorted(
+            {
+                _DIET_CONTAINS_LOOKUP[c]
+                for c in (str(x).upper().strip() for x in raw_contains)
+                if c in _DIET_CONTAINS_LOOKUP
+            }
+        )
+        if isinstance(raw_contains, list)
+        else []
+    )
+    # A profile that contradicts its own `contains` list is a model slip, and the two
+    # halves come from the same call — so trust the ingredient-level detail and drop the
+    # summary rather than keeping a "vegetarien" dish that admits to containing meat.
+    if profile in ("vegan", "vegetarien") and ({"viande", "poisson", "crustaces"} & set(contains)):
+        profile = None
+    elif profile == "poisson" and "viande" in contains:
+        profile = None
+    return {"profile": profile, "contains": contains}
+
+
+def _call_diet_batch(batch: list[tuple[int, dict]]) -> dict[int, dict[str, Any]]:
+    """Call Gemini to predict the diet profile of a batch of (index, raw_product)."""
+    lines = [_format_diet_product(i, raw) for i, raw in batch]
+    prompt = f"{DIET_SYSTEM_PROMPT}\n\nPlats :\n" + "\n".join(lines)
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
+    }
+    unknown = {"profile": None, "contains": []}
+    for attempt in range(3):
+        try:
+            response = _make_request(GEMINI_MODEL, payload)
+            text = response["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            parsed = json.loads(text)
+            result: dict[int, dict[str, Any]] = {}
+            for k, v in parsed.items():
+                try:
+                    idx = int(k)
+                except (ValueError, TypeError):
+                    continue
+                result[idx] = _parse_diet_value(v)
+            return result
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 503) and attempt < 2:
+                time.sleep(2 ** attempt * 2)
+                continue
+            log.warning("gemini_diet_http_error", code=exc.code, batch_size=len(batch))
+            return {i: dict(unknown) for i, _ in batch}
+        except Exception as exc:
+            if attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            log.warning("gemini_diet_failed", error=str(exc), batch_size=len(batch))
+            return {i: dict(unknown) for i, _ in batch}
+    return {i: dict(unknown) for i, _ in batch}
+
+
+def _load_diet_cache(db: Database, product_ids: list[int]) -> dict[int, dict[str, Any]]:
+    cached = {}
+    for doc in db.products.find(
+        {"_id": {"$in": product_ids}, "predicted_diet.source": DIET_PREDICTION_SOURCE},
+        {"_id": 1, "predicted_diet": 1},
+    ):
+        cached[doc["_id"]] = doc["predicted_diet"]
+    return cached
+
+
+def _save_diet_cache(db: Database, diet_map: dict[int, dict[str, Any]]) -> None:
+    ops = [
+        UpdateOne({"_id": pid}, {"$set": {"predicted_diet": prediction}})
+        for pid, prediction in diet_map.items()
+    ]
+    if ops:
+        db.products.bulk_write(ops, ordered=False)
+
+
+def batch_classify_diets(
+    db: Database,
+    raw_products: list[dict],
+    force: bool = False,
+) -> dict[int, dict[str, Any]]:
+    """Predict each product's diet profile from its ingredient list (cache-first).
+
+    Args:
+        db: MongoDB handle.
+        raw_products: raw JSONL dicts (must have ``product_id``).
+        force: ignore cache and re-classify.
+
+    Returns:
+        ``{product_id: {"profile": str|None, "contains": [str], "source": ..., "model": ...}}``
+        for every input product. ``profile: None`` means unknown — no ingredient list, or
+        an answer we refused. It never means "contains meat".
+    """
+    all_ids = [int(r["product_id"]) for r in raw_products]
+    id_to_raw = {int(r["product_id"]): r for r in raw_products}
+
+    cached = {} if force else _load_diet_cache(db, all_ids)
+    to_classify = [pid for pid in all_ids if pid not in cached]
+    log.info("diet_start", total=len(all_ids), from_cache=len(cached), via_llm=len(to_classify))
+    if not to_classify:
+        return cached
+
+    indexed = [(i, id_to_raw[pid]) for i, pid in enumerate(to_classify, start=1)]
+    batches = [indexed[i:i + BATCH_SIZE] for i in range(0, len(indexed), BATCH_SIZE)]
+    index_to_pid = {i: pid for i, pid in enumerate(to_classify, start=1)}
+    llm_results: dict[int, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(batches))) as executor:
+        futures = {executor.submit(_call_diet_batch, batch): batch for batch in batches}
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            llm_results.update(future.result())
+            log.info("diet_progress", batches_done=completed, total_batches=len(batches))
+
+    llm_by_pid = {
+        index_to_pid[idx]: {**pred, "source": DIET_PREDICTION_SOURCE, "model": GEMINI_MODEL}
+        for idx, pred in llm_results.items()
+        if idx in index_to_pid
+    }
+    _save_diet_cache(db, llm_by_pid)
+    final = {**cached, **llm_by_pid}
+
+    dist: dict[str, int] = {}
+    for pred in final.values():
+        dist[str(pred.get("profile"))] = dist.get(str(pred.get("profile")), 0) + 1
+    log.info("diet_complete", from_cache=len(cached), via_llm=len(llm_by_pid), profiles=dist)
+    return final
+
+
 # ── Auth helpers (mirrors waib-api/gemini_http.py) ────────────────────────────
 
 _CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -650,12 +907,52 @@ def _make_request(model: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 # ── Gemini batch call ─────────────────────────────────────────────────────────
 
+# How many pieces of an assortment to name. Enough to tell sweet from savoury, short
+# enough to keep 50 products in one prompt.
+_MAX_PIECES_SHOWN = 8
+
+
+def _composition_summary(raw: dict) -> str:
+    """What an assortment actually contains, from Carrefour's own piece list.
+
+    Without it the classifier had to guess from the name and the shelf, and "24 Petits
+    fours" (Département Boulangerie, rayon "Petits fours et mignardises") came out an
+    APÉRITIF while holding mini Trianons and mini éclairs — a dessert. "48 Petits fours
+    Réception" genuinely IS an apéritif, and the only thing telling the two apart is
+    what is inside: quiches and saucisses on one side, chocolate on the other. Three
+    products were misfiled this way, and the answer sat in the data the whole time.
+
+    Feeds every classifier that goes through _format_product — menu_step, dish_role and
+    event_fit all get it.
+    """
+    pieces = ((raw.get("composition") or {}).get("pieces")) or []
+    names = []
+    for piece in pieces:
+        if isinstance(piece, str):
+            label = piece.strip()
+        elif isinstance(piece, dict):
+            label = str(piece.get("name") or "").strip()
+        else:
+            continue
+        if label:
+            names.append(label)
+    if not names:
+        return ""
+    shown = names[:_MAX_PIECES_SHOWN]
+    more = f" (+{len(names) - len(shown)} autres)" if len(names) > len(shown) else ""
+    return ", ".join(shown) + more
+
+
 def _format_product(i: int, raw: dict) -> str:
     name = raw.get("name") or ""
     dept = raw.get("carrefour_suppliers_department") or ""
     cats = [c.get("category_name", "") for c in (raw.get("categories") or []) if c.get("category_name")]
     cats_str = ", ".join(cats[:4]) if cats else "aucune"
-    return f'{i}. Nom: "{name}" | Département: "{dept}" | Catégories: [{cats_str}]'
+    line = f'{i}. Nom: "{name}" | Département: "{dept}" | Catégories: [{cats_str}]'
+    contents = _composition_summary(raw)
+    if contents:
+        line += f" | Contient: [{contents}]"
+    return line
 
 
 def _call_batch(batch: list[tuple[int, dict]]) -> dict[int, str]:

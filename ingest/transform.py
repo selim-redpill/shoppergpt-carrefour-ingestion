@@ -186,6 +186,14 @@ def transform_product(raw: dict, all_prices: dict[int, list[float]]) -> dict:
         # Event(s) this product genuinely suits, e.g. ["Anniversaire", "Spécial enfant"],
         # or ["ALL"] for versatile products. From batch_classify_event_fit.
         "could_fit_event": raw.get("could_fit_event_llm") or ["ALL"],
+        # OUR PREDICTION, read off the ingredient list by an LLM — deliberately NOT
+        # merged into `dietary_tags` below, which holds Carrefour's own four
+        # `type_envie` values. The name, the `source` field inside it and the wording
+        # used downstream all have to keep the two apart: "Carrefour says this is
+        # vegetarian" and "we read the ingredients and think it is" are different
+        # promises. `profile: None` means unknown, never "contains meat".
+        # From batch_classify_diets.
+        "predicted_diet": raw.get("predicted_diet_llm"),
         # True for genuine build-your-own products — real structured Carrefour
         # data (composition_plateau below), not name-keyword guessing.
         "is_composable": is_composable,
