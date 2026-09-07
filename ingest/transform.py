@@ -15,6 +15,7 @@ from ingest.config import COMPOSITION_IMAGE_BASE, PRODUCT_IMAGE_BASE
 from ingest.derive import (
     derive_composable,
     derive_dietary_tags,
+    derive_family,
     derive_menu_step,
     derive_persons,
     derive_price_ref,
@@ -196,6 +197,9 @@ def transform_product(raw: dict, all_prices: dict[int, list[float]]) -> dict:
         # composer and the dietary critic. Rewritten on every ingest so a product
         # Carrefour re-tags cannot keep a stale restriction.
         "dietary_tags": dietary_tags,
+        # What the product IS (verrines, gougères, charcuterie) — lets the engine
+        # tell a varied step from the same thing served three times.
+        "family": derive_family(raw),
         "price_ref": price_ref,  # median across stores; None if no price data
         # ── Product details ──────────────────────────────────────
         "department": raw.get("carrefour_suppliers_department"),

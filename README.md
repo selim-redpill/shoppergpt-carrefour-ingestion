@@ -48,7 +48,7 @@ Everything else on the document is raw Carrefour data, unmodified.
 | `persons` | `raw.nb_portion` | `None` when Carrefour gives nothing. No fallback. |
 | `price_ref` | `prices` | Median across stores, used only when no store is selected — the store's own price always wins. |
 | `is_composable` / `composition_plateau` | `raw.composition_plateau` | Genuine build-your-own products, from Carrefour's structured groups (never name keywords). Piece `code`s are kept: the cart API needs them verbatim. |
-| `recommendable` | product name | `False` only for "au choix / à composer" products with no structured data behind them. Excluded from Mongo and Pinecone unless `INGEST_NON_RECOMMENDABLE=true`. |
+| `recommendable` | product name + `type_id` | `False` for a choice made at the counter from a card we never receive ("garniture au choix"), and for the opaque `bundle` menu formulas ("Menu Classique", "Menu enfant") — composing a menu is the assistant's own job, and those carry no contents to show. Always excluded from Mongo and Pinecone. |
 | `delai_prepa` | raw | Global lead time in days; per-store overrides stay in `raw.carrefour_delay`. |
 
 On stores, `--catalogue` adds `step_catalogue` (product count per step),

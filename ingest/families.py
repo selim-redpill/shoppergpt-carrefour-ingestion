@@ -131,6 +131,22 @@ _FORMAT_WORDS = frozenset(
     }
 )
 
+# Containers and occasion words: they say how a product is PACKAGED or WHEN it is
+# eaten, never what it is. Skipped only for the per-product family (see
+# ``family_word``'s ``skip_containers``), never for the store hints, where "plateau" is
+# a genuine Carrefour concept the query planner should know the store carries.
+#
+# The distinction matters for menu variety: a charcuterie platter, a vegetable platter
+# and a cheese platter are three different experiences, and collapsing them onto
+# "plateau" would make a varied apéritif look repetitive.
+_CONTAINER_WORDS = frozenset(
+    {
+        "plateau", "plateaux", "assiette", "assiettes", "planche", "planches", "box",
+        "coffret", "panier", "paniers", "apéro", "apero", "apéritif", "aperitif",
+        "apéritifs", "aperitifs",
+    }
+)
+
 _PAREN_RE = re.compile(r"\([^)]*\)")
 # Carrefour appends size/portion info after a dash: "Pain surprise polaire - 24 toasts".
 _TRAILING_DASH_RE = re.compile(r"[-–].*$")
@@ -167,19 +183,30 @@ def _fold(word: str) -> str:
     return folded
 
 
-def _family_word(name: str) -> str:
-    """The family-naming head word of one product name, or "" if none stands out."""
+def family_word(name: str, skip_containers: bool = False) -> str:
+    """The family-naming head word of one product name, or "" if none stands out.
+
+    ``skip_containers`` also walks past packaging and occasion words, so a "Plateau
+    apéro charcuterie" yields ``charcuterie`` instead of ``plateau``. Used for the
+    per-product ``family`` field, where the question is what the guest EATS; left off
+    for the store hints, where "plateau" is itself a family the store carries.
+    """
+    skipped = _FORMAT_WORDS | _CONTAINER_WORDS if skip_containers else _FORMAT_WORDS
     for word in _normalize(name).split(" "):
         if not word or word.isdigit():
             continue
         lowered = word.lower()
-        if lowered in _STOPWORDS or lowered in _FORMAT_WORDS:
+        if lowered in _STOPWORDS or lowered in skipped:
             continue
         # A lone letter/digit fragment ("l", "4") names nothing.
         if len(lowered) < 3:
             continue
         return lowered
     return ""
+
+
+# Kept as the private alias the store-hint code already uses.
+_family_word = family_word
 
 
 def extract_families(names: List[str], max_families: int = MAX_FAMILIES_PER_STEP) -> List[str]:

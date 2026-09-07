@@ -9,6 +9,7 @@ We derive only what is strictly required for the app to function:
   - price_ref     → median across stores
   - recommendable → filter out "compose-it-yourself" products
   - dietary_tags  → the diet-related subset of Carrefour's own type_envie
+  - family        → the head noun of the product name (verrines, gougères, charcuterie)
 
 Everything else (dietary restrictions, allergens, occasion tags, etc.)
 is kept as raw Carrefour data and left to the LLM to interpret.
@@ -16,6 +17,7 @@ is kept as raw Carrefour data and left to the LLM to interpret.
 
 import statistics
 
+from ingest.families import family_word
 from ingest.log import get_logger
 
 log = get_logger(__name__)
@@ -53,15 +55,18 @@ def _composition_plateau_groups(product: dict) -> list:
 
 
 def derive_composable(product: dict) -> bool:
-    """True for genuine build-your-own products (real Carrefour structured data,
-    not name guesswork) — see module comment above."""
-    if _composition_plateau_groups(product):
-        return True
-    picto = str(product.get("left_picto_hyper") or product.get("left_picto_super") or "")
-    if picto.strip().lower() == "a composer":
-        return True
-    mots_cles = str(product.get("mots_cles") or "").strip().lower()
-    return mots_cles == "composer"
+    """True for genuine build-your-own products — ONLY on real structured data.
+
+    The ``left_picto_hyper`` / ``mots_cles`` fallbacks used to count too, for "the rare
+    product with the picto but no composition_plateau block". Measured against the
+    catalogue, that fallback caught nothing it was meant to: of the 32 products
+    carrying the "A composer" picto, 21 have their structured groups and the other 11
+    are all ``type_id: bundle`` opaque menu formulas ("Menu Classique", "Menu enfant",
+    "Menu du Gastronome"…). It marked them composable, so the widget offered a
+    "Composer" flow with nothing to choose from, and ``derive_recommendable`` let them
+    through on the grounds that composable products are handled by that very flow.
+    """
+    return bool(_composition_plateau_groups(product))
 
 
 # ── recommendable ──────────────────────────────────────────────────────────────
@@ -74,12 +79,16 @@ def derive_composable(product: dict) -> bool:
 # ARE recommendable — that's exactly what the dedicated "Composer" flow (see
 # is_composable on the stored document) is for, not a reason to hide them.
 
+# NOT here: "à garnir". A product the customer garnishes themselves — "30 Navettes
+# Natures (à garnir)" — is COMPLETE as sold: there is no choice for us to resolve, the
+# rolls arrive plain and get filled at home. It belongs on a buffet, and this list was
+# the only thing keeping it out. The keywords that remain describe a choice made at the
+# counter from a card we never receive ("garniture au choix", "à préciser"), which the
+# assistant genuinely cannot present.
 _NON_RECOMMENDABLE_NAME_KEYWORDS = [
     "au choix",
     "à composer",
     "a composer",
-    "à garnir",
-    "a garnir",
     "composez",
     "à préciser",
     "a preciser",
@@ -93,8 +102,35 @@ def derive_recommendable(product: dict) -> bool:
     composition UI, so excluding them entirely would be wrong."""
     if derive_composable(product):
         return True
+    if _is_opaque_menu_bundle(product):
+        return False
     name = (product.get("name") or "").lower()
     return not any(kw in name for kw in _NON_RECOMMENDABLE_NAME_KEYWORDS)
+
+
+# Magento "bundle" products are formulas the customer assembles in store — a starter,
+# a main and a dessert picked from a card we do not receive. All 12 active ones are
+# "Menu X" ("Menu Classique", "Menu enfant", "Menu végétarien", "Menu du Gastronome",
+# "Menu familial…"), all in Plats, and NONE carries a composition_plateau or even a
+# named composition: there is nothing to tell the customer what they would eat.
+#
+# They are also a trap for the composer, which reads them as a cheap per-person main:
+# on a 100-guest wedding it swapped a Bœuf Wellington for "Menu Classique" ×100 —
+# 1290€, 43% of the budget, for a line the customer cannot inspect.
+#
+# The discriminator is `type_id`, not the name: the sushi platters are also called
+# "Menu One", "Menu San", "Menu Love" and are perfectly explicit — they are
+# `type_id: simple` with their piece count in the name.
+
+
+def _is_opaque_menu_bundle(product: dict) -> bool:
+    """A bundled formula with nothing to say about its contents."""
+    if str(product.get("type_id") or "").strip().lower() != "bundle":
+        return False
+    if _composition_plateau_groups(product):
+        return False
+    pieces = (product.get("composition") or {}).get("pieces")
+    return not pieces
 
 
 # ── dietary_tags ──────────────────────────────────────────────────────────────
@@ -128,6 +164,27 @@ def derive_dietary_tags(product: dict) -> list[str]:
         if label in _DIETARY_ENVIE_TAGS and label not in seen:
             seen.append(label)
     return seen
+
+
+# ── family ────────────────────────────────────────────────────────────────────
+
+
+def derive_family(product: dict) -> str | None:
+    """The kind of thing this product IS, from the head noun of its name.
+
+    Same extraction that builds the per-store ``step_families`` hints, applied per
+    product and stored on the document, because the API needs it for a question the
+    hints cannot answer: is this STEP varied? Three products can be three distinct
+    SKUs with no repeated ingredient and still be three verrines — "4 verrines
+    saumon", "6 verrines tomates thon", "4 verrines pesto" was a real apéritif for a
+    100-guest wedding, and nothing in the pipeline could see it as one experience
+    served three times.
+
+    Containers are skipped here (see ``family_word``): what a guest eats off a
+    charcuterie platter and off a vegetable platter is not the same thing.
+    """
+    label = family_word(product.get("name") or "", skip_containers=True)
+    return label or None
 
 
 # ── persons ───────────────────────────────────────────────────────────────────

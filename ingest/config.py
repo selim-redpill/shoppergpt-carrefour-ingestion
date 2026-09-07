@@ -69,9 +69,3 @@ _DEFAULT_PINECONE_INDEX = "waib-carrefour-prod-large" if _ENV == "prod" else "wa
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", _DEFAULT_PINECONE_INDEX)
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
-
-# ── Feature flags ─────────────────────────────────────────────────────────────
-# When False (default), "compose-it-yourself" products (… au choix / à composer)
-# are excluded from MongoDB *and* Pinecone — they never surface in the pipeline.
-# Set to "true" to re-enable storage and embedding of those products.
-INGEST_NON_RECOMMENDABLE = os.getenv("INGEST_NON_RECOMMENDABLE", "false").lower().strip() == "true"

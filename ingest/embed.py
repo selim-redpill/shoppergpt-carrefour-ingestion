@@ -29,7 +29,6 @@ from tqdm import tqdm
 from ingest.config import (
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
-    INGEST_NON_RECOMMENDABLE,
     OPENAI_API_KEY,
     PINECONE_API_KEY,
     PINECONE_INDEX_NAME,
@@ -49,8 +48,9 @@ _QUERY: dict[str, Any] = {
     "menu_step": {"$ne": None},
     "name": {"$exists": True, "$ne": ""},
 }
-if not INGEST_NON_RECOMMENDABLE:
-    _QUERY["recommendable"] = {"$ne": False}
+# Never embed a product the pipeline refuses to recommend: a vector outlives the
+# document it came from, so a non-recommendable product with a vector stays findable.
+_QUERY["recommendable"] = {"$ne": False}
 
 # Fields fetched from MongoDB — only what's needed for embedding and filtering.
 _PROJECTION: dict[str, int] = {

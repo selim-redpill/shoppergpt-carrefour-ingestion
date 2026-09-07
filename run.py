@@ -44,7 +44,7 @@ from ingest.categorize import (
     batch_classify_roles,
 )
 from ingest.concepts import load_store_concepts
-from ingest.config import INGEST_NON_RECOMMENDABLE, PRICES_FILE, PRODUCTS_FILE, STORES_FILE
+from ingest.config import PRICES_FILE, PRODUCTS_FILE, STORES_FILE
 from ingest.db import (
     bulk_upsert,
     bulk_upsert_prices,
@@ -252,7 +252,12 @@ def ingest_products(force_categorize: bool = False) -> None:
     with tqdm(total=total, unit="product", desc="products", file=sys.stderr) as bar:
         for raw in raw_products:
             doc = transform_product(raw, price_index)
-            if not INGEST_NON_RECOMMENDABLE and doc.get("recommendable") is False:
+            # Non-recommendable products never enter the pipeline. There used to be an
+            # INGEST_NON_RECOMMENDABLE escape hatch to keep them; it was removed because
+            # the only thing it achieved in practice was silently putting the opaque
+            # "Menu X" formulas back in front of the assistant on whichever machine had
+            # the flag set (see derive._is_opaque_menu_bundle).
+            if doc.get("recommendable") is False:
                 bar.update(1)
                 continue
             seen_ids.add(doc["_id"])
