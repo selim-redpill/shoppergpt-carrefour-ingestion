@@ -231,6 +231,13 @@ VALID_DRINK_ROLES = {
     "spiritueux",
     "aperitif",
     "chaud",
+    # Festive drinks that stand IN FOR alcohol: Champomy, alcohol-free beer,
+    # alcohol-free cocktails. Filed as plain softs until now, which made a weak
+    # kind of sense on the shelf and none at the table — they are what the guests
+    # who do not drink alcohol raise at the toast, not what everyone drinks with
+    # the meal. Sizing them as softs put 40 bottles of Champomy (120€) on a
+    # 100-adult wedding.
+    "sans_alcool",
 }
 # Cheapest family, drunk by everyone, never sized on adults alone: a
 # misclassification lands on the safe side of both the budget and the guest count.
@@ -240,7 +247,8 @@ _DRINK_ROLE_LOOKUP: dict[str, str] = {r.upper(): r for r in VALID_DRINK_ROLES}
 DRINK_ROLE_SYSTEM_PROMPT = """Tu es un expert en traiteur français. Pour chaque BOISSON ci-dessous, indique sa famille.
 
 eau : eau plate ou gazeuse NON aromatisée (source, minérale).
-soft : boissons sans alcool — jus, nectars, sodas, limonades, thés glacés, boissons aux fruits, cocktails sans alcool, bières sans alcool, eaux aromatisées.
+soft : boissons non alcoolisées du quotidien — jus, nectars, sodas, limonades, thés glacés, boissons aux fruits, eaux aromatisées.
+sans_alcool : boissons de FÊTE sans alcool, qui remplacent une boisson alcoolisée — jus de pomme pétillant type Champomy, cocktails sans alcool, bières sans alcool, vins/mousseux désalcoolisés. Le critère : le produit imite une boisson alcoolisée ou sert à trinquer.
 vin : vin tranquille rouge, blanc ou rosé (y compris désigné par sa seule appellation : Riesling, Chablis, Coteaux-du-Layon, Sancerre…).
 petillant : vin effervescent AUTRE que champagne — crémant, prosecco, mousseux, clairette.
 champagne : champagne uniquement.
@@ -251,10 +259,12 @@ aperitif : apéritifs à diluer — Aperol, Spritz, vermouth, porto, pastis.
 chaud : boissons chaudes — café, thé en sachets/vrac, infusions, chocolat chaud.
 
 ATTENTION aux pièges de nommage :
-- "bière sans alcool" → soft (pas biere)
+- "bière sans alcool" → sans_alcool (ni biere, ni soft)
+- "cocktail sans alcool" → sans_alcool
+- "jus de pomme pétillant" (Champomy) → sans_alcool (pas petillant)
 - "eau aromatisée", "eau gazeuse aromatisée" → soft (pas eau)
 - "thé glacé", "boisson au thé" → soft (pas chaud)
-- "jus de pomme pétillant" (Champomy), "cocktail sans alcool" → soft (pas petillant)
+- un jus ou un soda ordinaire reste soft : "sans_alcool" est réservé à ce qui remplace un alcool.
 
 Réponds UNIQUEMENT en JSON valide où les clés sont les NUMÉROS des produits :
 {"1": "vin", "2": "soft", ...}
@@ -266,10 +276,13 @@ En cas de doute absolu, utilise "soft"."""
 # flavoured water as table water also exempts it from budget arbitration, and
 # sizing an alcohol-free beer on adults only under-serves everyone else.
 _DRINK_ROLE_OVERRIDES: list[tuple[str, str]] = [
-    (r"sans[\s-]?alcool", "soft"),
+    # Alcohol-free versions of alcoholic drinks, and the sparkling apple juice sold
+    # for toasting: they replace an alcohol, so they are sized for the guests who
+    # don't drink one — not for everybody like a soda.
+    (r"sans[\s-]?alcool", "sans_alcool"),
+    (r"champomy", "sans_alcool"),
     (r"\beaux?\b.{0,20}aromatis", "soft"),
     (r"th[ée] glac|boisson au th[ée]|ice[\s-]?tea", "soft"),
-    (r"champomy", "soft"),
     # Kept LAST: a box of tea bags / ground coffee is a hot drink, not a soft.
     # The iced-tea patterns above must win over this one.
     (r"\bth[ée]s?\b|caf[ée]|chicor[ée]e|infusion", "chaud"),

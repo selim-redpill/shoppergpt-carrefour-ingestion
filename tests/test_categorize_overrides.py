@@ -14,11 +14,13 @@ from ingest.categorize import VALID_DRINK_ROLES, _drink_role_override
 @pytest.mark.parametrize(
     "name,expected",
     [
-        # Alcohol-free versions of alcoholic drinks: sizing these on adults only
-        # would under-serve everyone else at the table.
-        ("6 Bières au citron sans alcool Tourtel", "soft"),
-        ("6 bières 1664 sans alcool", "soft"),
-        ("Cocktail sans alcool passion Mister Cocktail", "soft"),
+        # Alcohol-free versions of alcoholic drinks belong to their own family: they
+        # stand IN FOR an alcohol, so they are sized for the guests who skip it, not
+        # for the whole table like a soda. Filed as softs, they were ordered by the
+        # dozen — 40 bottles of Champomy on a wedding of 100 adults.
+        ("6 Bières au citron sans alcool Tourtel", "sans_alcool"),
+        ("6 bières 1664 sans alcool", "sans_alcool"),
+        ("Cocktail sans alcool passion Mister Cocktail", "sans_alcool"),
         # Flavoured water is not table water — treating it as such also exempts
         # it from budget arbitration.
         ("Eau aromatisée au citron Volvic", "soft"),
@@ -27,14 +29,19 @@ from ingest.categorize import VALID_DRINK_ROLES, _drink_role_override
         ("Thé glacé pêche Lipton", "soft"),
         ("Boisson au thé vert glacé saveur citron menthe Lipton", "soft"),
         ("ICE TEA LIPTON 2L", "soft"),
-        # Sparkling apple juice sold as a celebration drink.
-        ("Jus de pomme pétillant Champomy", "soft"),
+        # Sparkling apple juice sold for toasting — same family, same reason.
+        ("Jus de pomme pétillant Champomy", "sans_alcool"),
         # Tea to brew and ground coffee are hot drinks — they are sold by mass,
         # so they must stay out of the per-litre arithmetic.
         ("Thé 5 fruits rouges Lipton", "chaud"),
         ("Thé vert menthe Carrefour", "chaud"),
         ("Café moulu Tradition", "chaud"),
         ("Café Soluble Chicorée Original Ricore", "chaud"),
+        # A plain juice or soda stays a soft: `sans_alcool` is reserved for what
+        # replaces an alcohol, and widening it would put the everyday drinks on the
+        # children's ratio.
+        ("Jus d'orange 100% pur fruit pressé Carrefour", None),
+        ("Soda à l'orange Orangina", None),
         # Nothing to override: the model's own answer stands.
         ("Champagne brut Tsarine - 75cl", None),
         ("Vin rouge Bordeaux Mouton Cadet", None),
